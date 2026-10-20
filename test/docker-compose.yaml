@@ -1,0 +1,28 @@
+# The stack test/roundtrip.sh runs against: Postgres and the backup sidecar,
+# wired up the way an app's compose file would.
+services:
+  postgres:
+    image: postgres:${PG_MAJOR:-17}-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 1s
+      retries: 30
+  postgres-backup:
+    image: ${IMAGE:-pg-backup:test}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:-}
+    volumes:
+      - backups:/backups
+volumes:
+  backups:

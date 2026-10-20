@@ -1,0 +1,148 @@
+#!/bin/bash
+# Encrypted Postgres backups: pg_dump | gzip | age, with hourly, daily, weekly
+# and monthly retention. See README.md.
+#
+#   pg-backup loop            hourly dumps, forever (the container's default command)
+#   pg-backup now             one dump into deployments/, e.g. before a deploy
+#   pg-backup list [n]        the newest n dumps (default 20)
+#   pg-backup restore <dump>  decrypt a dump and load it over the database
+#   pg-backup dump <dir> <prefix> <keep>
+#                             one dump into <dir>, keeping the newest <keep>
+set -euo pipefail
+
+BACKUP_DIR=${BACKUP_DIR:-/backups}
+PREFIX=${BACKUP_PREFIX:-${POSTGRES_DB:-}}
+PGHOST=${POSTGRES_HOST:-postgres}
+PGPORT=${POSTGRES_PORT:-5432}
+export PGHOST PGPORT PGUSER=${POSTGRES_USER:-} PGPASSWORD=${POSTGRES_PASSWORD:-} PGDATABASE=${POSTGRES_DB:-}
+
+log() { echo "[pg-backup] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
+
+require_recipient() {
+  # Refuse rather than fall back to plaintext.
+  : "${BACKUP_AGE_RECIPIENT:?BACKUP_AGE_RECIPIENT is unset; set it to the public half of your age key}"
+}
+
+require_db() {
+  : "${POSTGRES_USER:?POSTGRES_USER is unset}"
+  : "${POSTGRES_DB:?POSTGRES_DB is unset}"
+}
+
+# Newest first; everything past the Nth goes.
+prune() {
+  local glob=$1 keep=$2
+  ls -t $glob 2>/dev/null | tail -n +$((keep + 1)) | xargs -r rm --
+}
+
+cmd_dump() {
+  local dest=${1:?usage: pg-backup dump <dir> <prefix> <keep>}
+  local prefix=${2:?usage: pg-backup dump <dir> <prefix> <keep>}
+  local keep=${3:?usage: pg-backup dump <dir> <prefix> <keep>}
+  require_recipient
+  require_db
+
+  mkdir -p "$dest"
+  local final="$dest/$prefix-$(date '+%Y%m%d-%H%M%S').sql.gz.age"
+
+  # Written under .part and renamed only once pg_dump, gzip and age have all
+  # succeeded, so a dump killed halfway never looks like a backup.
+  local part="$final.part"
+  trap "rm -f '$part'" EXIT
+
+  # --clean --if-exists lets a restore load the dump over the live database.
+  pg_dump --clean --if-exists | gzip | age -r "$BACKUP_AGE_RECIPIENT" > "$part"
+
+  mv "$part" "$final"
+  trap - EXIT
+
+  prune "$dest/$prefix-*.sql.gz.age" "$keep"
+  echo "$final"
+}
+
+cmd_now() {
+  cmd_dump "$BACKUP_DIR/deployments" "$PREFIX-deploy" "${BACKUP_KEEP_DEPLOYS:-20}"
+}
+
+# The first dump of a period becomes that period's keeper. It is a hard link to
+# the hourly dump, so the longer tiers cost no extra bytes.
+promote() {
+  local src=$1 dir=$2 key=$3
+  mkdir -p "$dir"
+  [ -e "$dir/$key.sql.gz.age" ] || ln "$src" "$dir/$key.sql.gz.age"
+}
+
+cmd_loop() {
+  # Checked at start, so a missing key is a container that fails to come up
+  # rather than one that looks healthy and writes nothing.
+  require_recipient
+  require_db
+
+  local keep_hours=${BACKUP_KEEP_HOURS:-48}
+  local keep_days=${BACKUP_KEEP_DAYS:-7}
+  local keep_weeks=${BACKUP_KEEP_WEEKS:-4}
+  local keep_months=${BACKUP_KEEP_MONTHS:-6}
+  local file
+
+  log "hourly dumps of $POSTGRES_DB -> $BACKUP_DIR/hourly, encrypted to $BACKUP_AGE_RECIPIENT"
+
+  while true; do
+    # Wait out a Postgres restart instead of losing the hour.
+    until pg_isready -q; do sleep 5; done
+
+    if file=$(cmd_dump "$BACKUP_DIR/hourly" "$PREFIX" "$keep_hours"); then
+      promote "$file" "$BACKUP_DIR/daily" "$(date '+%Y%m%d')"
+      promote "$file" "$BACKUP_DIR/weekly" "$(date '+%GW%V')"
+      promote "$file" "$BACKUP_DIR/monthly" "$(date '+%Y%m')"
+      prune "$BACKUP_DIR/daily/*.sql.gz.age" "$keep_days"
+      prune "$BACKUP_DIR/weekly/*.sql.gz.age" "$keep_weeks"
+      prune "$BACKUP_DIR/monthly/*.sql.gz.age" "$keep_months"
+      log "$file"
+    else
+      # A failed backup is the moment to try more often, not less.
+      log "FAILED, retrying in 5m"
+      sleep 300
+      continue
+    fi
+    sleep $((3600 - $(date +%s) % 3600))
+  done
+}
+
+cmd_list() {
+  ls -t "$BACKUP_DIR"/*/*.sql.gz.age 2>/dev/null | head -n "${1:-20}"
+}
+
+# Run this in a throwaway container (docker compose run --rm), with the private
+# key mounted at $BACKUP_AGE_IDENTITY_FILE. The long-lived loop container only
+# ever has the public half.
+cmd_restore() {
+  local src=${1:?usage: pg-backup restore <dump.sql.gz.age>}
+  local identity=${BACKUP_AGE_IDENTITY_FILE:-/run/age.key}
+  require_db
+
+  [ -r "$src" ] || { echo "Cannot read dump: $src" >&2; exit 1; }
+  [ -r "$identity" ] || { echo "Cannot read identity at $identity; mount the private key there" >&2; exit 1; }
+
+  if [ "${RESTORE_ASSUME_YES:-}" != "1" ]; then
+    echo "This replaces the contents of database '$POSTGRES_DB' on $PGHOST."
+    printf "Type the database name to confirm: "
+    local confirm
+    read -r confirm
+    [ "$confirm" = "$POSTGRES_DB" ] || { echo "Aborted."; exit 1; }
+  fi
+
+  # One transaction, so a restore that fails halfway leaves the database as it was.
+  age -d -i "$identity" "$src" | gunzip | psql -q -1 -v ON_ERROR_STOP=1 >/dev/null
+  echo "Restored $src into '$POSTGRES_DB'."
+}
+
+case ${1:-} in
+  loop | now | list | restore | dump)
+    cmd=$1
+    shift
+    "cmd_$cmd" "$@"
+    ;;
+  *)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" >&2
+    exit 1
+    ;;
+esac
