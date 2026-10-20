@@ -9,7 +9,8 @@ ghcr.io/haitrr/pg-backup:17      # also :16 and :18; match your server's major v
 ghcr.io/haitrr/pg-backup:17-<sha>
 ```
 
-Images are rebuilt weekly to pick up Postgres patch releases.
+Images are rebuilt weekly to pick up Postgres patch releases. `docker compose up` keeps whichever copy it pulled first,
+so run `docker compose pull postgres-backup` when you deploy to get them.
 
 ## What it keeps
 
